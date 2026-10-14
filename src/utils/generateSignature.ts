@@ -1,8 +1,6 @@
-import crypto from "crypto";
+import { createHmac } from "crypto";
 
-export function generateSignature(payload: string): string {
-  return crypto
-    .createHmac("sha256", process.env.WEBHOOK_SECRET!)
-    .update(payload)
-    .digest("hex");
+/** HMAC-SHA256 hex signature over the exact JSON bytes that are POSTed (§9.2). */
+export function generateSignature(payloadJson: string, secret: string): string {
+  return createHmac("sha256", secret).update(payloadJson, "utf8").digest("hex");
 }

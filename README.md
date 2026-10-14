@@ -1,178 +1,181 @@
-# TRON & BSC Transaction Watcher
+# Tether-Watcher
 
-This is a service that watches for USDT transactions on both TRON (TRC20) and BSC (BEP20) networks and triggers webhooks when specific transactions are completed, failed, or expired.
+Address-subscription watcher for USDT on TRON (TRC20) and BNB Smart Chain (BEP20).
+Subscribed addresses are matched against every confirmed block; matches are queued in a
+local SQLite outbox and delivered to webhook endpoints asynchronously.
 
-> [!CAUTION]
-> This service is in its early stages of development and is expected to improve significantly over time. While it provides functionality for watching USDT transactions on TRON and BSC networks, it should not be solely relied upon for production use at this stage. We recommend users to independently save transaction hashes to handle any cases in which transactions are resent by the webhook. Please stay tuned for future updates and improvements.
+## Architecture
 
-## Features
+```text
+BlockScannerService ─── per network, one sequential loop, holds a lease
+        │  1 block  =  1 write transaction
+        ▼
+   SQLite (WAL)  ── webhook_addresses (clustered B-Tree) · deliveries (outbox) · quotas
+        ▲
+        │  atomic claim / retry / backoff
+DeliveryWorkerService ─── at-least-once POSTs with HMAC-SHA256 signatures
+```
 
-- Watch USDT transactions on both TRON (TRC20) and BSC (BEP20) networks
-- In-memory storage for watched transactions and processed events using JavaScript's `Map`
-- Configurable confirmation requirements per network
-- Automatic retries for failed transactions
-- Comprehensive webhook notifications for transaction status changes
-- Supports both mainnet and testnet environments
-- Network-specific configuration (min/max amounts, block times, retry intervals)
-- Administrative API endpoints for network management
-- Monitoring endpoints for service health and statistics
+- **Scanner** – walks `checkpoint + 1 → head - confirmations` one block at a time, performs one
+  `json_each` batch lookup per block against millions of addresses (no in-memory maps), and commits
+  matched events, quota counters, and the new checkpoint atomically.
+- **Worker** – claims due deliveries with a single `UPDATE … RETURNING`, signs each payload with the
+  webhook's own secret, retries transient failures with exponential backoff, and dead-letters
+  permanent ones.
+- **Quotas** – every webhook belongs to a subscription plan (`max_webhooks`, `max_addresses`,
+  `max_deliverable_events`). Counters are materialized and maintained atomically; events beyond the
+  plan's event quota are ignored and counted as dropped.
 
-## Technologies
+Full design: [`PRD.md`](./PRD.md).
 
-- **Node.js**
-- **Express.js**
-- **TronWeb** - To interact with the TRON blockchain
-- **Ethers.js** - To interact with the BSC blockchain
-- **BigNumber.js** - For handling large numbers in transactions
-- **Winston** - Logging framework
-- **Axios** - For sending webhooks
-- **Zod** - For request validation
+## Requirements
+
+- Node.js **≥ 22**
+- A TronGrid API key (recommended) and a BSC JSON-RPC endpoint
 
 ## Setup
 
-### Prerequisites
+```bash
+npm install
+npm run build
+cp .env.example .env   # then edit it
+npm start
+```
 
-- Node.js v14+
-- NPM or Yarn
-- TRON API Key (for `TronWeb`)
-- TRON RPC URL (for mainnet/testnet)
-- BSC RPC URL (for mainnet/testnet)
+Development (`ts-node-dev`, no build step): `npm run dev`
 
-### Installation
+### Configuration
 
-1. Clone the repository:
+| Variable | Default | Purpose |
+| :--- | :--- | :--- |
+| `PORT` | `3000` | HTTP port |
+| `API_KEY` | *(required)* | Shared key for `X-API-Key` |
+| `DATABASE_URL` | `file:./data/tether-watcher.db` | libSQL/SQLite URL |
+| `NETWORK_MODE` | `mainnet` | `mainnet` or `testnet` (echoed in payloads) |
+| `LOG_LEVEL` | `info` | `error` \| `warn` \| `info` \| `debug` |
+| `TRC20_ENABLED` / `BEP20_ENABLED` | `true` | Disable a network's scanner |
+| `TRC20_CONFIRMATIONS` / `BEP20_CONFIRMATIONS` | `20` / `12` | Depth before a block is scanned |
+| `TRC20_TOKEN_CONTRACT` | USDT TRC20 | Token contract to index |
+| `BEP20_TOKEN_CONTRACT` | USDT BEP20 | Token contract to index |
+| `TRC20_DECIMALS` / `BEP20_DECIMALS` | `6` / `18` | Decimals used for `amountDecimal` |
+| `TRC20_START_BLOCK` / `BEP20_START_BLOCK` | *(unset)* | First height on a fresh database; otherwise start at the safe head |
+| `TRONGRID_URL` / `TRON_API_KEY` | `https://api.trongrid.io` | TronGrid endpoint and key |
+| `BSC_RPC_URL` | `https://bsc-dataseed.bnbchain.org` | BSC JSON-RPC endpoint (must be archive-capable for deep catch-up) |
+| `SCANNER_IDLE_INTERVAL_MS` | `3000` | Sleep when the scanner is caught up |
+| `WORKER_POLL_INTERVAL_MS` | `500` | Outbox poll interval |
+| `WORKER_BATCH_SIZE` | `50` | Deliveries claimed per poll |
+| `WORKER_CONCURRENCY` | `20` | Parallel HTTP dispatches |
+| `WORKER_HTTP_TIMEOUT_MS` | `5000` | Per-request timeout |
+| `WORKER_BACKOFF_BASE_MS` | `2000` | First retry delay (`base · 2^attempt`, capped at 1 h) |
+| `DELIVERY_RETENTION_DAYS` | `30` | Retention for `DELIVERED` / `DEAD_LETTER` rows |
+| `PRUNE_INTERVAL_MS` | `86400000` | Retention sweep cadence |
 
-   ```bash
-   git clone https://github.com/moha-abdi/tether-watcher.git
-   cd tether-watcher
-   ```
+## API
 
-2. Install the dependencies:
+All routes live under `/api/watcher` and require `X-API-Key`, except `GET /health`.
 
-   ```bash
-   npm install
-   ```
+| Method & Path | Purpose |
+| :--- | :--- |
+| `GET /health` | Public liveness: SQLite probe + per-network checkpoint/lease state |
+| `POST /plans` | Create a subscription plan (quota template) |
+| `GET /plans/:planId` | Plan limits and current counters |
+| `PATCH /plans/:planId` | Update limits, `isActive`, or `resetEventQuota` |
+| `POST /plans/:planId/reconcile` | Recompute derived counters from the source tables |
+| `POST /webhooks` | Create a webhook for a plan, optionally with initial addresses |
+| `GET /webhooks/:webhookId` | Webhook config, address count, `?includeAddresses=true` for the list |
+| `PATCH /webhooks/:webhookId` | Update URL/secret/filter/`isActive`, or move it to another plan |
+| `DELETE /webhooks/:webhookId` | Delete the webhook with its addresses and queued deliveries |
+| `POST /webhooks/:webhookId/addresses` | Bulk-add addresses (up to 1000) |
+| `DELETE /webhooks/:webhookId/addresses` | Remove addresses and release quota |
+| `GET /deliveries` | Inspect the outbox (`?webhookId=&planId=&status=&limit=&offset=`) |
+| `GET /stats` | Scanner state, plan aggregates, queue depth, retention |
 
-3. Create a `.env` file at the root of your project and add the following environment variables:
+Quota failures answer `403` with `WEBHOOK_QUOTA_EXCEEDED` / `ADDRESS_QUOTA_EXCEEDED`;
+an address that contradicts the webhook's `networkFilter` answers
+`400 ADDRESS_NETWORK_MISMATCH`; narrowing a filter while conflicting addresses exist answers
+`409 NETWORK_FILTER_CONFLICT`.
 
-   ```
-   PORT=3000
-   NODE_ENV=development  # or production
-
-   # TRON Configuration
-   TRON_MAINNET_URL="https://api.trongrid.io"
-   TRON_TESTNET_URL="https://api.shasta.trongrid.io"
-   TRON_PRO_API_KEY="your-tron-api-key"
-   TRON_MAINNET_CONTRACT="TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
-   TRON_TESTNET_CONTRACT="your-testnet-contract"
-
-   # BSC Configuration
-   BSC_MAINNET_URL="https://bsc-dataseed.binance.org"
-   BSC_TESTNET_URL="https://data-seed-prebsc-1-s1.binance.org:8545"
-   BSC_MAINNET_CONTRACT="0x55d398326f99059fF775485246999027B3197955"
-   BSC_TESTNET_CONTRACT="your-testnet-contract"
-
-   # Security
-   API_KEY="your-secure-api-key"
-   WEBHOOK_SECRET="your-secure-webhook-secret"
-   ```
-
-4. Build the project:
-
-   ```bash
-   npm run build
-   ```
-
-5. Run the application:
-   ```bash
-   npm start
-   ```
-
-### Development
-
-For development, use the following command to start the server with `ts-node-dev`:
+### Example
 
 ```bash
-npm run dev
+curl -s -X POST http://localhost:3000/api/watcher/plans -H "X-API-Key: $API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"starter","maxWebhooks":2,"maxAddresses":50,"maxDeliverableEvents":10000}'
+
+curl -s -X POST http://localhost:3000/api/watcher/webhooks -H "X-API-Key: $API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"planId":"plan_...","url":"https://example.com/hook","networkFilter":"TRC20",
+       "addresses":[{"network":"TRC20","address":"TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf"}]}'
 ```
 
-## API Endpoints
+The response includes the webhook `secret`; store it to verify signatures.
 
-### Transaction Management
+## Webhook deliveries
 
-#### Add a Transaction to Watch
+Each POST carries the stored payload and these headers:
 
-**POST** `/api/watcher/watch`
-
-Request body:
-```json
-{
-  "id": "unique-transaction-id",
-  "network": "TRON",  // or "BSC"
-  "fromAddress": "sender-address",
-  "expectedRecipientAddress": "recipient-address",
-  "amount": 100,
-  "webhookUrl": "https://yourwebhook.com/transaction"
-}
-```
-
-#### Remove a Transaction from Watch
-
-**DELETE** `/api/watcher/watch/:id`
-
-#### Get Transaction Status
-
-**GET** `/api/watcher/watch/:id`
-
-### Network Management
-
-#### Get All Networks Status
-
-**GET** `/api/watcher/networks`
-
-#### Get Specific Network Status
-
-**GET** `/api/watcher/networks/:network`
-
-## Webhook Notifications
-
-The service sends webhook notifications for the following transaction states:
-- COMPLETED: Transaction confirmed with required confirmations
-- FAILED: Transaction failed or exceeded maximum retry attempts
-- EXPIRED: Transaction not found within the expiration window
-
-Each webhook request includes:
-- Transaction ID
-- Network (TRON/BSC)
-- Status
-- Transaction hash (for completed transactions)
-- Block number (for completed transactions)
-- Number of confirmations (for completed transactions)
-- Error message (for failed transactions)
-- Network mode (testnet/mainnet)
-
-### Webhook Security
-
-Each webhook request includes an `X-Webhook-Signature` header for verification. The signature is generated using HMAC-SHA256 and your webhook secret:
+| Header | Meaning |
+| :--- | :--- |
+| `X-Webhook-Signature` | `HMAC-SHA256(secret, raw body)` hex digest |
+| `X-Webhook-Id` | Webhook that matched |
+| `X-Delivery-Id` | Stable delivery id (`eventId` in the body) |
+| `X-Delivery-Attempt` | 1-based attempt counter |
 
 ```typescript
 import crypto from "crypto";
 
-function verifyWebhookSignature(payload: string, signature: string): boolean {
-  const expectedSignature = crypto
-    .createHmac("sha256", process.env.WEBHOOK_SECRET!)
-    .update(payload)
-    .digest("hex");
-  return crypto.timingSafeEqual(
-    Buffer.from(signature),
-    Buffer.from(expectedSignature)
-  );
+export function verify(rawBody: string, signature: string, secret: string): boolean {
+  const expected = crypto.createHmac("sha256", secret).update(rawBody, "utf8").digest("hex");
+  return expected.length === signature.length &&
+    crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
 }
 ```
 
-## Contributing
+Payload (stored verbatim in `deliveries.payload_json`):
 
-Feel free to fork this repository and contribute by submitting pull requests. For any major changes, please open an issue first to discuss the changes.
+```json
+{
+  "eventId": "del_...",
+  "eventType": "USDT_TRANSFER",
+  "network": "TRC20",
+  "networkMode": "mainnet",
+  "webhookId": "wh_...",
+  "planId": "plan_...",
+  "matchedAddress": "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf",
+  "direction": "INCOMING",
+  "transaction": {
+    "txHash": "…", "logIndex": 0, "blockNumber": 65432198, "blockTimestamp": 1760458200000,
+    "fromAddress": "T…", "toAddress": "T…", "tokenContract": "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
+    "tokenSymbol": "USDT", "decimals": 6, "amountRaw": "100500000", "amountDecimal": "100.5"
+  },
+  "createdAt": "2026-10-14T16:50:00.000Z"
+}
+```
+
+Retries: `408`, `429`, `5xx`, and network errors back off exponentially up to `max_attempts` (5);
+other `4xx` responses and exhausted attempts move the delivery to `DEAD_LETTER`.
+**Delivery is at-least-once** — deduplicate on `X-Delivery-Id` (`eventId`).
+
+## Operations
+
+- **WAL + `synchronous = NORMAL`**: no committed state is corrupted on crash, but an OS-level power
+  loss can drop the most recent commits; the affected block is simply re-scanned. Use
+  `PRAGMA synchronous = FULL` if every commit must survive power loss.
+- **Single scanner per network**: the scanner takes a 30 s lease (`block_checkpoints.lease_owner`)
+  and heartbeats every 10 s; a second instance exits non-zero rather than double-counting quotas.
+- **Reorgs**: each block's `parentHash` must match the committed `last_block_hash`. A mismatch stops
+  that network's scanner and leaves the checkpoint untouched.
+- **Retention**: terminal deliveries older than `DELIVERY_RETENTION_DAYS` are pruned in bounded
+  batches; `PENDING`/`FAILED`/`PROCESSING` rows are never pruned.
+- **Backups**: use the SQLite online backup API (or stop the process) rather than copying a live
+  WAL file set.
+
+## Development
+
+```bash
+npm run typecheck   # tsc --noEmit
+npm test            # vitest: schema invariants, quota accounting, scanner/worker pipeline
+```
 
 ## License
 

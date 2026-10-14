@@ -1,283 +1,301 @@
-import express from "express";
+import { Router, type RequestHandler } from "express";
 import { z } from "zod";
-import {
-  TetherWatcher,
-  Network,
-  TransactionStatus,
-} from "../services/TetherWatcher";
-import { authenticateApiKey } from "../middleware/auth";
-import { logger } from "../utils/logger";
+import type { Database } from "../db/database";
+import { ValidationError } from "../errors";
+import { createApiKeyAuth } from "../middleware/auth";
+import type { CheckpointRepository } from "../repositories/CheckpointRepository";
+import type { DeliveryRepository } from "../repositories/DeliveryRepository";
+import type { PlanRepository } from "../repositories/PlanRepository";
+import type { WebhookRepository } from "../repositories/WebhookRepository";
+import type { Network } from "../types";
 
-// Validation schemas
-const watchSchema = z.object({
-  id: z.string().nonempty(),
-  network: z.nativeEnum(Network),
-  fromAddress: z.string().nonempty(),
-  expectedRecipientAddress: z.string().nonempty(),
-  amount: z.number().positive(),
-  webhookUrl: z.string().url(),
+const networkSchema = z.enum(["TRC20", "BEP20"]);
+const networkFilterSchema = z.enum(["TRC20", "BEP20", "ALL"]);
+const statusSchema = z.enum([
+  "PENDING",
+  "PROCESSING",
+  "DELIVERED",
+  "FAILED",
+  "DEAD_LETTER",
+]);
+
+const addressInputSchema = z.object({
+  network: networkSchema,
+  address: z.string().min(1),
 });
 
-const networkConfigSchema = z.object({
-  enabled: z.boolean().optional(),
-  confirmations: z.number().min(1).optional(),
-  minAmount: z.string().optional(),
-  maxAmount: z.string().optional(),
-  retryInterval: z.number().min(1000).optional(),
+const createPlanSchema = z.object({
+  id: z.string().min(1).optional(),
+  name: z.string().min(1),
+  maxWebhooks: z.number().int().min(0),
+  maxAddresses: z.number().int().min(0),
+  maxDeliverableEvents: z.number().int().min(0),
 });
 
-const dateRangeSchema = z.object({
-  startDate: z.string().datetime().optional(),
-  endDate: z.string().datetime().optional(),
+const updatePlanSchema = z
+  .object({
+    name: z.string().min(1).optional(),
+    maxWebhooks: z.number().int().min(0).optional(),
+    maxAddresses: z.number().int().min(0).optional(),
+    maxDeliverableEvents: z.number().int().min(0).optional(),
+    isActive: z.boolean().optional(),
+    resetEventQuota: z.boolean().optional(),
+  })
+  .refine(
+    (patch) => Object.values(patch).some((value) => value !== undefined),
+    { message: "at least one field must be provided" },
+  );
+
+const createWebhookSchema = z.object({
+  planId: z.string().min(1),
+  url: z.string().url(),
+  secret: z.string().min(1).optional(),
+  description: z.string().nullable().optional(),
+  networkFilter: networkFilterSchema.optional(),
+  addresses: z.array(addressInputSchema).max(1000).optional(),
 });
 
-export const watcherRoutes = (tetherWatcher: TetherWatcher) => {
-  const router = express.Router();
+const updateWebhookSchema = z
+  .object({
+    url: z.string().url().optional(),
+    secret: z.string().min(1).optional(),
+    description: z.string().nullable().optional(),
+    networkFilter: networkFilterSchema.optional(),
+    isActive: z.boolean().optional(),
+    planId: z.string().min(1).optional(),
+  })
+  .refine(
+    (patch) => Object.values(patch).some((value) => value !== undefined),
+    { message: "at least one field must be provided" },
+  );
 
-  // Error handler middleware
-  const errorHandler = (
-    err: any,
-    req: express.Request,
-    res: express.Response,
-    next: express.NextFunction,
-  ) => {
-    logger.error("Route error:", err);
-    res.status(500).json({
-      error: "Internal server error",
-      message: process.env.NODE_ENV === "development" ? err.message : undefined,
-    });
+const addressesBodySchema = z.object({
+  addresses: z.array(addressInputSchema).min(1).max(1000),
+});
+
+const webhookDetailQuerySchema = z.object({
+  includeAddresses: z.enum(["true", "false"]).optional(),
+  limit: z.coerce.number().int().min(1).max(500).default(200),
+  cursor: z.string().min(1).optional(),
+});
+
+const deliveriesQuerySchema = z.object({
+  webhookId: z.string().min(1).optional(),
+  planId: z.string().min(1).optional(),
+  status: statusSchema.optional(),
+  limit: z.coerce.number().int().min(1).max(200).default(50),
+  offset: z.coerce.number().int().min(0).default(0),
+});
+
+/** Parses with zod and converts failures into `400 VALIDATION_ERROR`. */
+function parse<T extends z.ZodTypeAny>(schema: T, input: unknown): z.output<T> {
+  const result = schema.safeParse(input);
+  if (!result.success) {
+    const details = result.error.issues
+      .map((issue) => `${issue.path.join(".") || "body"}: ${issue.message}`)
+      .join("; ");
+    throw new ValidationError(details);
+  }
+  return result.data;
+}
+
+/** Express 4 does not forward rejected promises; this adapts async handlers to `next`. */
+function asyncHandler(
+  handler: (req: Parameters<RequestHandler>[0], res: Parameters<RequestHandler>[1]) => Promise<void>,
+): RequestHandler {
+  return (req, res, next) => {
+    handler(req, res).catch(next);
   };
+}
 
-  // Middleware to validate network parameter
-  const validateNetwork = async (
-    req: express.Request,
-    res: express.Response,
-    next: express.NextFunction,
-  ) => {
-    const network = req.params.network as Network;
-    try {
-      await tetherWatcher.validateNetwork(network);
-      next();
-    } catch (error) {
-      res.status(400).json({ error: (error as Error).message });
-    }
-  };
+export interface WatcherRouteDependencies {
+  db: Database;
+  plans: PlanRepository;
+  webhooks: WebhookRepository;
+  deliveries: DeliveryRepository;
+  checkpoints: CheckpointRepository;
+  apiKey: string;
+  networks: Array<{ network: Network; enabled: boolean; confirmations: number }>;
+  retentionDays: number;
+}
 
-  // Transaction Management Routes
-  router.post("/watch", authenticateApiKey, async (req, res, next) => {
-    try {
-      const validation = watchSchema.safeParse(req.body);
-      if (!validation.success) {
-        res.status(400).json({ errors: validation.error.errors });
-        return;
-      }
-
-      const {
-        id,
-        network,
-        fromAddress,
-        expectedRecipientAddress,
-        amount,
-        webhookUrl,
-      } = req.body;
-
-      await tetherWatcher.addTransaction(
-        id,
-        network,
-        fromAddress,
-        expectedRecipientAddress,
-        amount,
-        webhookUrl,
-      );
-
-      res.json({
-        message: `${network} transaction added to watch list`,
-        isTestnet: tetherWatcher.isTestMode,
-        transactionId: id,
-      });
-    } catch (error) {
-      if (error instanceof Error) {
-        res.status(400).json({ error: error.message });
-      } else {
-        next(error);
-      }
-    }
-  });
-
-  router.delete("/watch/:id", authenticateApiKey, async (req, res, next) => {
-    try {
-      await tetherWatcher.removeTransaction(req.params.id);
-      res.json({
-        message: "Transaction removed from watch list",
-        transactionId: req.params.id,
-      });
-    } catch (error) {
-      if (error instanceof Error) {
-        res.status(400).json({ error: error.message });
-      } else {
-        next(error);
-      }
-    }
-  });
-
-  router.get("/watch/:id", authenticateApiKey, async (req, res, next) => {
-    try {
-      const transaction = tetherWatcher.getWatchedTransaction(req.params.id);
-      if (!transaction) {
-        res.status(404).json({ error: "Transaction not found" });
-        return;
-      }
-      res.json({
-        transaction,
-        isTestnet: tetherWatcher.isTestMode,
-      });
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  // Network Status and Configuration Routes
-  router.get("/networks", authenticateApiKey, async (req, res) => {
-    const networks = await Promise.all(
-      Object.values(Network).map(async (network) => {
-        return await tetherWatcher.getNetworkStatus(network);
-      }),
-    );
-
-    res.json({
-      networks: networks.filter((n) => n !== null),
-      isTestnet: tetherWatcher.isTestMode,
-    });
-  });
+/**
+ * REST surface (§10). `GET /health` is public; every other route requires `X-API-Key`.
+ * A single shared key means there is no per-tenant authorization by design.
+ */
+export function createWatcherRoutes(deps: WatcherRouteDependencies): Router {
+  const router = Router();
 
   router.get(
-    "/networks/:network",
-    authenticateApiKey,
-    validateNetwork,
-    async (req, res, next) => {
+    "/health",
+    asyncHandler(async (_req, res) => {
       try {
-        const network = req.params.network as Network;
-        const status = await tetherWatcher.getNetworkStatus(network);
-        if (!status) {
-          res.status(404).json({ error: "Network not found" });
-          return;
-        }
-        res.json(status);
-      } catch (error) {
-        next(error);
+        await deps.db.query("SELECT 1 AS ok");
+      } catch {
+        res.status(503).json({ status: "degraded", database: "unavailable" });
+        return;
       }
-    },
+      const scanners = [];
+      for (const network of deps.networks) {
+        const checkpoint = await deps.checkpoints.get(network.network);
+        scanners.push({
+          network: network.network,
+          enabled: network.enabled,
+          confirmations: network.confirmations,
+          lastProcessedBlock: checkpoint?.lastProcessedBlock ?? null,
+          lastBlockHash: checkpoint?.lastBlockHash ?? null,
+          leaseOwner: checkpoint?.leaseOwner ?? null,
+          leaseExpiresAt: checkpoint?.leaseExpiresAt ?? null,
+          leaseActive: Boolean(
+            checkpoint?.leaseOwner &&
+              checkpoint.leaseExpiresAt &&
+              checkpoint.leaseExpiresAt > Date.now(),
+          ),
+        });
+      }
+      res.json({ status: "ok", database: "ok", scanners });
+    }),
   );
 
-  // Administrative Routes (protected by admin authentication)
-  // TODO: use seperate authentication for admin routes instead of default authenticateApiKey
+  router.use(createApiKeyAuth(deps.apiKey));
+
+  router.post(
+    "/plans",
+    asyncHandler(async (req, res) => {
+      const input = parse(createPlanSchema, req.body);
+      const plan = await deps.plans.create(input);
+      res.status(201).json(plan);
+    }),
+  );
+
+  router.get(
+    "/plans/:planId",
+    asyncHandler(async (req, res) => {
+      res.json(await deps.plans.getById(req.params.planId));
+    }),
+  );
+
   router.patch(
-    "/admin/networks/:network",
-    authenticateApiKey,
-    validateNetwork,
-    async (req, res, next) => {
-      try {
-        const network = req.params.network as Network;
-        const validation = networkConfigSchema.safeParse(req.body);
-
-        if (!validation.success) {
-          res.status(400).json({ errors: validation.error.errors });
-          return;
-        }
-
-        await tetherWatcher.updateNetworkConfig(network, validation.data);
-        res.json({
-          message: `${network} configuration updated`,
-          network: await tetherWatcher.getNetworkStatus(network),
-        });
-      } catch (error) {
-        next(error);
-      }
-    },
+    "/plans/:planId",
+    asyncHandler(async (req, res) => {
+      const patch = parse(updatePlanSchema, req.body);
+      res.json(await deps.plans.update(req.params.planId, patch));
+    }),
   );
 
   router.post(
-    "/admin/networks/:network/enable",
-    authenticateApiKey,
-    validateNetwork,
-    async (req, res, next) => {
-      try {
-        const network = req.params.network as Network;
-        await tetherWatcher.setNetworkEnabled(network, true);
-        res.json({
-          message: `${network} enabled`,
-          status: await tetherWatcher.getNetworkStatus(network),
-        });
-      } catch (error) {
-        next(error);
-      }
-    },
+    "/plans/:planId/reconcile",
+    asyncHandler(async (req, res) => {
+      res.json(await deps.plans.reconcile(req.params.planId));
+    }),
   );
 
   router.post(
-    "/admin/networks/:network/disable",
-    authenticateApiKey,
-    validateNetwork,
-    async (req, res, next) => {
-      try {
-        const network = req.params.network as Network;
-        await tetherWatcher.setNetworkEnabled(network, false);
-        res.json({
-          message: `${network} disabled`,
-          status: await tetherWatcher.getNetworkStatus(network),
-        });
-      } catch (error) {
-        next(error);
-      }
-    },
+    "/webhooks",
+    asyncHandler(async (req, res) => {
+      const input = parse(createWebhookSchema, req.body);
+      const { webhook, createdAddresses } = await deps.webhooks.create(input);
+      res.status(201).json({ webhook, createdAddresses });
+    }),
   );
 
-  // Monitoring Routes
-  router.get("/stats", authenticateApiKey, async (req, res) => {
-    const validation = dateRangeSchema.safeParse(req.query);
-    if (!validation.success) {
-      res.status(400).json({ errors: validation.error.errors });
-    }
+  router.get(
+    "/webhooks/:webhookId",
+    asyncHandler(async (req, res) => {
+      const query = parse(webhookDetailQuerySchema, req.query);
+      const webhook = await deps.webhooks.getById(req.params.webhookId);
+      const addressCount = await deps.webhooks.countAddresses(
+        deps.db,
+        webhook.id,
+      );
+      if (query.includeAddresses !== "true") {
+        res.json({ webhook, addressCount });
+        return;
+      }
+      const page = await deps.webhooks.listAddresses({
+        webhookId: webhook.id,
+        limit: query.limit,
+        cursor: query.cursor ?? null,
+      });
+      res.json({
+        webhook,
+        addressCount,
+        addresses: page.addresses,
+        nextCursor: page.nextCursor,
+      });
+    }),
+  );
 
-    const stats = {
-      watchedTransactions: {
-        total: tetherWatcher.getWatchedTransactionsCount(),
-        byNetwork: Object.values(Network).reduce(
-          (acc, network) => ({
-            ...acc,
-            [network]: tetherWatcher.getWatchedTransactionsCount(network),
-          }),
-          {},
-        ),
-      },
-      processedEvents: tetherWatcher.getProcessedEventsCount(),
-      lastProcessedBlocks: Object.values(Network).reduce(
-        (acc, network) => ({
-          ...acc,
-          [network]: tetherWatcher.getLastProcessedBlock(network),
-        }),
-        {},
-      ),
-      isTestnet: tetherWatcher.isTestMode,
-    };
+  router.patch(
+    "/webhooks/:webhookId",
+    asyncHandler(async (req, res) => {
+      const patch = parse(updateWebhookSchema, req.body);
+      res.json(await deps.webhooks.update(req.params.webhookId, patch));
+    }),
+  );
 
-    res.json(stats);
-  });
+  router.delete(
+    "/webhooks/:webhookId",
+    asyncHandler(async (req, res) => {
+      res.json(await deps.webhooks.delete(req.params.webhookId));
+    }),
+  );
 
-  // Health Check Route (no authentication required)
-  router.get("/health", (req, res) => {
-    res.json({
-      status: "ok",
-      timestamp: new Date().toISOString(),
-      isTestnet: tetherWatcher.isTestMode,
-    });
-  });
+  router.post(
+    "/webhooks/:webhookId/addresses",
+    asyncHandler(async (req, res) => {
+      const body = parse(addressesBodySchema, req.body);
+      res.json(await deps.webhooks.addAddresses(req.params.webhookId, body.addresses));
+    }),
+  );
 
-  // Apply error handler to all routes
-  router.use(errorHandler);
+  router.delete(
+    "/webhooks/:webhookId/addresses",
+    asyncHandler(async (req, res) => {
+      const body = parse(addressesBodySchema, req.body);
+      res.json(
+        await deps.webhooks.removeAddresses(req.params.webhookId, body.addresses),
+      );
+    }),
+  );
+
+  router.get(
+    "/deliveries",
+    asyncHandler(async (req, res) => {
+      const query = parse(deliveriesQuerySchema, req.query);
+      const deliveries = await deps.deliveries.list(query);
+      res.json({
+        deliveries,
+        limit: query.limit,
+        offset: query.offset,
+      });
+    }),
+  );
+
+  router.get(
+    "/stats",
+    asyncHandler(async (_req, res) => {
+      const scanners = [];
+      for (const network of deps.networks) {
+        const checkpoint = await deps.checkpoints.get(network.network);
+        scanners.push({
+          network: network.network,
+          enabled: network.enabled,
+          confirmations: network.confirmations,
+          lastProcessedBlock: checkpoint?.lastProcessedBlock ?? null,
+          lastBlockTimestamp: checkpoint?.lastBlockTimestamp ?? null,
+          leaseOwner: checkpoint?.leaseOwner ?? null,
+          leaseExpiresAt: checkpoint?.leaseExpiresAt ?? null,
+        });
+      }
+      res.json({
+        scanners,
+        plans: await deps.plans.stats(),
+        deliveries: { byStatus: await deps.deliveries.countByStatus() },
+        retention: { days: deps.retentionDays },
+      });
+    }),
+  );
 
   return router;
-};
-
-// Export types for external use
-export type WatcherRoutes = ReturnType<typeof watcherRoutes>;
+}

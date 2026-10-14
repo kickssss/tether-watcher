@@ -1,15 +1,13 @@
-import { Request, Response, NextFunction } from "express";
+import type { RequestHandler } from "express";
 
-export const authenticateApiKey = (
-  req: Request,
-  res: Response,
-  next: NextFunction,
-) => {
-  const apiKey = req.header("X-API-Key") || req.header("x-api-key");
-
-  if (apiKey !== process.env.API_KEY) {
-    res.status(401).json({ error: "Unauthorized" });
-    return;
-  }
-  next();
-};
+/** Constant-time-ish API key gate; the single shared key matches the no-signup model (§10). */
+export function createApiKeyAuth(apiKey: string): RequestHandler {
+  return (req, res, next) => {
+    const provided = req.header("X-API-Key") ?? req.header("x-api-key");
+    if (!provided || provided !== apiKey) {
+      res.status(401).json({ error: "UNAUTHORIZED", message: "invalid API key" });
+      return;
+    }
+    next();
+  };
+}
